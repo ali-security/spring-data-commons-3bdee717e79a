@@ -1,0 +1,107 @@
+# Sealed-build workflow for the ali-security fork.
+# Upstream CI runs on Jenkins (Jenkinsfile, ci/pipeline.properties) on eclipse-temurin JDK 17 ("baseline main")
+# and JDK 21 ("baseline next"); the only GitHub Actions workflow upstream ships (project.yml) is an issue bot.
+# This mirrors the Jenkinsfile command verbatim:
+#   ./mvnw -s settings.xml clean dependency:list verify -Dsort -B -U
+name: Seal Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional surefire test selector (-Dtest)"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    name: Build and test (JDK ${{ matrix.java }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        java: [ '17', '21' ]
+    env:
+      MAVEN_OPTS: -Duser.name=spring-builds+jenkins
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ matrix.java }}
+          distribution: temurin
+
+      # -Dscan=false / -Dgradle.cache.*: the .mvn Develocity extension's build scan and remote
+      # build cache need Jenkins credentials that a fork does not have.
+      - name: Build and test
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./mvnw -s settings.xml -Dscan=false -Dgradle.cache.local.enabled=false -Dgradle.cache.remote.enabled=false \
+              clean dependency:list verify -Dsort -B -U \
+              -Dtest='${{ inputs.test-filter }}' -Dsurefire.failIfNoSpecifiedTests=false
+          else
+            ./mvnw -s settings.xml -Dscan=false -Dgradle.cache.local.enabled=false -Dgradle.cache.remote.enabled=false \
+              clean dependency:list verify -Dsort -B -U
+          fi
+
+      - name: Upload jar
+        if: matrix.java == '17'
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-data-commons-jar
+          path: target/spring-data-commons-3.3.1.jar
+          if-no-files-found: error
+
+      - name: Test report (totals and every skipped test with its reason)
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import glob, os, re
+          import xml.etree.ElementTree as ET
+          # Skips whose runner message does not state the cause on its own.
+          KNOWN = {
+              ("ClassGeneratingPropertyAccessorFactoryTests", "[89]"):
+                  "parameter case 89 is upstream's 'Class in default package' fixture, which has an empty "
+                  "propertyName by design; the test guards it with assumeThat(propertyName).isNotEmpty(), "
+                  "so the AssertJ assumption message 'Expecting actual not to be empty' is the intended skip",
+          }
+          def assume_lines(classname, method):
+              path = "src/test/java/" + classname.replace(".", "/").split("$")[0]
+              for ext in (".java", ".kt"):
+                  if os.path.exists(path + ext):
+                      src = open(path + ext, encoding="utf-8").read().splitlines()
+                      return [l.strip() for l in src if re.search(r"\bassum", l) and not l.strip().startswith("import")][:3]
+              return []
+          files = sorted(glob.glob("target/surefire-reports/TEST-*.xml") + glob.glob("target/failsafe-reports/TEST-*.xml"))
+          t = f = e = s = 0
+          skipped = []
+          for path in files:
+              root = ET.parse(path).getroot()
+              for case in root.iter("testcase"):
+                  t += 1
+                  if case.find("failure") is not None:
+                      f += 1
+                  elif case.find("error") is not None:
+                      e += 1
+                  elif case.find("skipped") is not None:
+                      s += 1
+                      sk = case.find("skipped")
+                      msg = re.sub(r"\s+", " ", (sk.get("message") or "") + " " + (sk.text or "")).strip()
+                      msg = re.split(r" at (?:java\.base/|org\.assertj\.|org\.junit\.)", msg)[0][:240]
+                      cls = case.get("classname") or ""
+                      name = case.get("name") or ""
+                      skipped.append((cls, name, msg or "(no message reported by runner)"))
+          print(f"=== spring-data-commons: {len(files)} report files, tests={t} passed={t - f - e - s} failures={f} errors={e} skipped={s}")
+          for cls, name, msg in skipped:
+              short = cls.split(".")[-1]
+              print(f"SKIPPED {short}.{name[:120]}")
+              print(f"    message: {msg}")
+              for (kc, kn), reason in KNOWN.items():
+                  if kc == short and kn in name:
+                      print(f"    reason: {reason}")
+              for line in assume_lines(cls, name):
+                  print(f"    assumption in source: {line}")
+          EOF
