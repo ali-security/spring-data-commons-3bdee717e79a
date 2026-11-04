@@ -39,7 +39,13 @@ import org.springframework.expression.EvaluationContext;
 import org.springframework.expression.Expression;
 import org.springframework.expression.TypedValue;
 import org.springframework.expression.spel.SpelEvaluationException;
+import org.springframework.expression.spel.SpelMessage;
+import org.springframework.expression.spel.SpelNode;
 import org.springframework.expression.spel.SpelParserConfiguration;
+import org.springframework.expression.spel.ast.Assign;
+import org.springframework.expression.spel.ast.OpDec;
+import org.springframework.expression.spel.ast.OpInc;
+import org.springframework.expression.spel.standard.SpelExpression;
 import org.springframework.expression.spel.standard.SpelExpressionParser;
 import org.springframework.expression.spel.support.SimpleEvaluationContext;
 import org.springframework.lang.NonNull;
@@ -52,25 +58,41 @@ import org.springframework.web.bind.WebDataBinder;
  *
  * @author Oliver Gierke
  * @author Johannes Englmeier
+ * @author Christoph Strobl
  * @since 1.10
  */
 class MapDataBinder extends WebDataBinder {
 
+	static final int DEFAULT_COLLECTION_LIMIT = 1024;
+
 	private final Class<?> type;
 	private final ConversionService conversionService;
+
+	/**
+	 * Creates a new {@link MapDataBinder} for the given type and {@link ConversionService},
+	 * limiting collections to a size of {@link #DEFAULT_COLLECTION_LIMIT} for data binding.
+	 *
+	 * @param type target type to detect property that need to be bound.
+	 * @param conversionService the {@link ConversionService} to be used to preprocess values.
+	 */
+	public MapDataBinder(Class<?> type, ConversionService conversionService) {
+		this(type, conversionService, DEFAULT_COLLECTION_LIMIT);
+	}
 
 	/**
 	 * Creates a new {@link MapDataBinder} for the given type and {@link ConversionService}.
 	 *
 	 * @param type target type to detect property that need to be bound.
 	 * @param conversionService the {@link ConversionService} to be used to preprocess values.
+	 * @param collectionSizeLimit the maximum size of a collection to be bound.
+	 * @since 3.5.12
 	 */
-	public MapDataBinder(Class<?> type, ConversionService conversionService) {
-
+	public MapDataBinder(Class<?> type, ConversionService conversionService, int collectionSizeLimit) {
 		super(new HashMap<String, Object>());
 
 		this.type = type;
 		this.conversionService = conversionService;
+		this.setAutoGrowCollectionLimit(collectionSizeLimit);
 	}
 
 	@NonNull
@@ -89,7 +111,8 @@ class MapDataBinder extends WebDataBinder {
 
 	@Override
 	protected ConfigurablePropertyAccessor getPropertyAccessor() {
-		return new MapPropertyAccessor(type, getTarget(), conversionService);
+		return new MapPropertyAccessor(type, getTarget(), conversionService, true,
+			getAutoGrowCollectionLimit());
 	}
 
 	/**
@@ -98,22 +121,32 @@ class MapDataBinder extends WebDataBinder {
 	 *
 	 * @author Oliver Gierke
 	 * @author Johannes Englmeier
+	 * @author Christoph Strobl
 	 * @since 1.10
 	 */
 	private static class MapPropertyAccessor extends AbstractPropertyAccessor {
 
 		private static final SpelExpressionParser PARSER = new SpelExpressionParser(
-				new SpelParserConfiguration(false, true));
+			new SpelParserConfiguration(false, true, MapDataBinder.DEFAULT_COLLECTION_LIMIT));
 
 		private final Class<?> type;
 		private final Map<String, Object> map;
 		private final ConversionService conversionService;
+		private final SpelExpressionParser parser;
 
-		public MapPropertyAccessor(Class<?> type, Map<String, Object> map, ConversionService conversionService) {
+		public MapPropertyAccessor(Class<?> type, Map<String, Object> map, ConversionService conversionService,
+			boolean autoGrowCollections, int maxAutoGrowCollectionSize) {
 
 			this.type = type;
 			this.map = map;
 			this.conversionService = conversionService;
+
+			if (!autoGrowCollections || maxAutoGrowCollectionSize != MapDataBinder.DEFAULT_COLLECTION_LIMIT) {
+				parser = new SpelExpressionParser(
+					new SpelParserConfiguration(false, autoGrowCollections, maxAutoGrowCollectionSize));
+			} else {
+				parser = PARSER;
+			}
 		}
 
 		@Override
@@ -183,12 +216,33 @@ class MapDataBinder extends WebDataBinder {
 					.withRootObject(map) //
 					.build();
 
-			Expression expression = PARSER.parseExpression(propertyName);
+			Expression expression = parser.parseExpression(propertyName);
 
 			try {
+				if (expression instanceof SpelExpression spelExpression) {
+					assertAssignmentDisabled(spelExpression.getAST());
+				}
 				expression.setValue(context, value);
 			} catch (SpelEvaluationException o_O) {
 				throw new NotWritablePropertyException(type, propertyName, "Could not write property", o_O);
+			}
+		}
+
+		/**
+		 * Rejects assignment ({@code =}), increment ({@code ++}) and decrement ({@code --}) operators anywhere within the
+		 * given expression, equivalent to evaluating it against a {@link SimpleEvaluationContext} with assignment disabled.
+		 *
+		 * @param node must not be {@literal null}.
+		 * @throws SpelEvaluationException if the expression contains an assignment, increment or decrement operator.
+		 */
+		private static void assertAssignmentDisabled(SpelNode node) {
+
+			if (node instanceof Assign || node instanceof OpInc || node instanceof OpDec) {
+				throw new SpelEvaluationException(node.getStartPosition(), SpelMessage.NOT_ASSIGNABLE, node.toStringAST());
+			}
+
+			for (int i = 0; i < node.getChildCount(); i++) {
+				assertAssignmentDisabled(node.getChild(i));
 			}
 		}
 

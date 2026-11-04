@@ -40,6 +40,7 @@ import org.springframework.format.support.DefaultFormattingConversionService;
  * Unit tests for {@link MapDataBinder}.
  *
  * @author Oliver Gierke
+ * @author Christoph Strobl
  */
 class MapDataBinderUnitTests {
 
@@ -116,6 +117,88 @@ class MapDataBinderUnitTests {
 		assertThatExceptionOfType(NotWritablePropertyException.class) //
 				.isThrownBy(() -> accessor.setPropertyValue("fooBar[T(java.lang.String)]", null)) //
 				.withCauseInstanceOf(SpelEvaluationException.class);
+	}
+
+	@Test // GH-3495
+	void acceptsValuesWithinConfiguredMaxCollectionSize() {
+
+		MapDataBinder dataBinder = new MapDataBinder(Bar.class, new DefaultFormattingConversionService());
+		dataBinder.setAutoGrowCollectionLimit(300);
+		var accessor = dataBinder.getPropertyAccessor();
+
+		accessor.setPropertyValue("fooBar[299]", "Spring");
+
+		assertThat((Collection<?>) dataBinder.getTarget().get("fooBar")).hasSize(300);
+	}
+
+	@Test // GH-3495
+	void rejectsValuesBeyondConfiguredMaxCollectionSize() {
+
+		var accessor = new MapDataBinder(Bar.class, new DefaultFormattingConversionService())
+			.getPropertyAccessor();
+
+		assertThatNoException().isThrownBy(() -> accessor.setPropertyValue("fooBar[299]", "Spring"));
+
+		assertThatExceptionOfType(NotWritablePropertyException.class) //
+			.isThrownBy(() -> accessor.setPropertyValue("fooBar[2000]", "Spring")) //
+			.withCauseInstanceOf(SpelEvaluationException.class);
+	}
+
+	@Test // GH-3495
+	void limitsAutoGrowCollectionsToDefaultLimit() {
+
+		var accessor = new MapDataBinder(Bar.class, new DefaultFormattingConversionService()).getPropertyAccessor();
+
+		assertThatExceptionOfType(NotWritablePropertyException.class) //
+				.isThrownBy(() -> accessor.setPropertyValue("fooBar[" + MapDataBinder.DEFAULT_COLLECTION_LIMIT + "]", "Spring")) //
+				.withCauseInstanceOf(SpelEvaluationException.class);
+
+		var binder = new MapDataBinder(Bar.class, new DefaultFormattingConversionService());
+		binder.getPropertyAccessor().setPropertyValue("fooBar[" + (MapDataBinder.DEFAULT_COLLECTION_LIMIT - 1) + "]",
+				"Spring");
+
+		assertThat((Collection<?>) binder.getTarget().get("fooBar")).hasSize(MapDataBinder.DEFAULT_COLLECTION_LIMIT);
+	}
+
+	@Test // GH-3495
+	void doesNotGrowCollectionBeyondLimitWhenBindingParameters() {
+
+		var values = new MutablePropertyValues();
+		values.add("foo.bar.fooBar[100000]", "Spring");
+
+		var result = bind(values);
+
+		List<String> list = new ArrayList<>();
+
+		assertThat(result).isEqualTo(singletonMap("foo", singletonMap("bar", singletonMap("fooBar", list))));
+	}
+
+	@Test // GH-3495
+	void honorsCollectionSizeLimitHandedToConstructor() {
+
+		var accessor = new MapDataBinder(Bar.class, new DefaultFormattingConversionService(), 10).getPropertyAccessor();
+
+		assertThatExceptionOfType(NotWritablePropertyException.class) //
+				.isThrownBy(() -> accessor.setPropertyValue("fooBar[10]", "Spring")) //
+				.withCauseInstanceOf(SpelEvaluationException.class);
+
+		var binder = new MapDataBinder(Bar.class, new DefaultFormattingConversionService(), 10);
+		binder.getPropertyAccessor().setPropertyValue("fooBar[9]", "Spring");
+
+		assertThat((Collection<?>) binder.getTarget().get("fooBar")).hasSize(10);
+	}
+
+	@Test // GH-3495
+	void rejectsAssignmentWithinPropertyExpression() {
+
+		var binder = new MapDataBinder(Bar.class, new DefaultFormattingConversionService());
+		var accessor = binder.getPropertyAccessor();
+
+		assertThatExceptionOfType(NotWritablePropertyException.class) //
+				.isThrownBy(() -> accessor.setPropertyValue("fooBar[somethingWeird = 0]", "Spring")) //
+				.withCauseInstanceOf(SpelEvaluationException.class);
+
+		assertThat(binder.getTarget()).doesNotContainKey("somethingWeird");
 	}
 
 	private static Map<String, Object> bind(PropertyValues values) {
